@@ -1,0 +1,32 @@
+{
+  "test-1": {
+    "id": "test-1",
+    "title": "Test Auction",
+    "description": "Desc",
+    "imageUrl": "",
+    "seller": {
+      "address": "kaspa:123"
+    },
+    "startPrice": 100,
+    "currentPrice": 120,
+    "minimumIncrement": 10,
+    "startTime": "2026-01-23T09:01:22.617Z",
+    "endTime": "2026-01-23T09:01:42.617Z",
+    "status": "live",
+    "bids": [
+      {
+        "id": "tx1",
+        "auctionId": "test-1",
+        "bidderAddress": "bidder1",
+        "amount": 120,
+        "timestamp": "2026-01-23T09:01:32.623Z",
+        "status": "detected",
+        "txHash": "tx1"
+      }
+    ],
+    "bidCount": 1,
+    "highestBidder": {
+      "address": "bidder1"
+    }
+  }
+}
