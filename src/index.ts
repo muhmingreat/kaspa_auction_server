@@ -17,7 +17,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: "*", // In production, restrict this to the frontend URL
+        origin: ["https://kaspa-auction.vercel.app", "http://localhost:3000"],
         methods: ["GET", "POST"]
     }
 });
