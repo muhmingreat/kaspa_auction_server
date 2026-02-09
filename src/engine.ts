@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { Bid, Auction, BidStatus } from '../../types/auction';
+import { Bid, Auction, BidStatus } from './types/auction';
 import { kaspaService } from './kaspa';
 
 const DATA_PATH = path.join(__dirname, '../data/auctions.json');

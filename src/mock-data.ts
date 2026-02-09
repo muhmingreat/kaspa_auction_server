@@ -1,3 +1,3 @@
-import { Auction } from '../../types/auction';
+import { Auction } from './types/auction';
 
 export const mockAuctions: Auction[] = [];
