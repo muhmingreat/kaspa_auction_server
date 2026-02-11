@@ -14,12 +14,17 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: ["https://kaspa-auction.vercel.app", "http://localhost:3000"],
+        origin: [
+            
+            "https://kaspa-auction.vercel.app",
+        
+            "http://localhost:3000"
+        ],
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['websocket']
 });
 
 // Map to keep track of active monitors per auction
@@ -167,7 +172,7 @@ app.post('/api/test/simulate-bid', async (req: Request, res: Response) => {
     }
 });
 
-const PORT = process.env.PORT || 3005;
+const PORT = process.env.PORT || 3500;
 httpServer.listen(PORT, () => {
     console.log(`[Server] Auction Engine running on port ${PORT}`);
 });
