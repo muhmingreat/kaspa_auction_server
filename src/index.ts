@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 
 import { auctionEngine } from './engine';
 import { kaspaService } from './kaspa';
+import connectDB from './db/connect';
 
 dotenv.config();
 
@@ -18,7 +19,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const io = new Server(httpServer, {
     cors: {
         origin: [
-            "https://kaspa-auction.vercel.app",
+            process.env.CORS_ORIGIN || "https://kaspa-auction.vercel.app",
             "http://localhost:3000",
         ],
         methods: ["GET", "POST"]
@@ -32,8 +33,8 @@ const activeMonitors = new Map<string, () => void>();
 /**
  * Starts monitoring an auction's receiving address
  */
-const monitorAuction = (auctionId: string) => {
-    const auction = auctionEngine.getAuction(auctionId);
+const monitorAuction = async (auctionId: string) => {
+    const auction = await auctionEngine.getAuction(auctionId);
     if (!auction || auction.status === 'ended') return;
 
     // Use the seller address as the receiving address for now 
@@ -49,7 +50,10 @@ const monitorAuction = (auctionId: string) => {
         if (validatedBid) {
             console.log(`[Monitor] Valid bid detected and processed for Auction ${auctionId}`);
             io.emit('new_bid', { auctionId, bid: validatedBid });
-            io.emit('auction_updated', auctionEngine.getAuction(auctionId));
+
+            // Fetch fresh state to emit
+            const updatedAuction = await auctionEngine.getAuction(auctionId);
+            io.emit('auction_updated', updatedAuction);
         }
     });
 
@@ -57,21 +61,26 @@ const monitorAuction = (auctionId: string) => {
 };
 
 // Initial monitoring for all live auctions
-auctionEngine.getAllAuctions().forEach(a => {
-    if (a.status === 'live') {
-        monitorAuction(a.id);
-    }
-});
+const startMonitoring = async () => {
+    const auctions = await auctionEngine.getAllAuctions();
+    auctions.forEach(a => {
+        if (a.status === 'live') {
+            monitorAuction(a.id);
+        }
+    });
+};
 
 // WebSocket logic
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
     console.log(`[Socket] User connected: ${socket.id}`);
 
     // Send initial state
-    socket.emit('all_auctions', auctionEngine.getAllAuctions());
+    const auctions = await auctionEngine.getAllAuctions();
+    socket.emit('all_auctions', auctions);
 
-    socket.on('request_auctions', () => {
-        socket.emit('all_auctions', auctionEngine.getAllAuctions());
+    socket.on('request_auctions', async () => {
+        const updatedAuctions = await auctionEngine.getAllAuctions();
+        socket.emit('all_auctions', updatedAuctions);
     });
 
     socket.on('disconnect', () => {
@@ -80,11 +89,12 @@ io.on('connection', (socket) => {
 });
 
 // API Routes
-app.get('/api/auctions', (req: Request, res: Response) => {
-    res.json(auctionEngine.getAllAuctions());
+app.get('/api/auctions', async (req: Request, res: Response) => {
+    const auctions = await auctionEngine.getAllAuctions();
+    res.json(auctions);
 });
 
-app.post('/api/auctions', (req: Request, res: Response) => {
+app.post('/api/auctions', async (req: Request, res: Response) => {
     const { title, description, imageUrl, startPrice, duration, category, sellerAddress } = req.body;
 
     const newAuction = {
@@ -105,15 +115,18 @@ app.post('/api/auctions', (req: Request, res: Response) => {
         bidCount: 0
     };
 
-    auctionEngine.createAuction(newAuction);
+    await auctionEngine.createAuction(newAuction);
     monitorAuction(newAuction.id); // Start monitoring the new auction immediately
-    io.emit('all_auctions', auctionEngine.getAllAuctions()); // Notify all clients
+
+    const allAuctions = await auctionEngine.getAllAuctions();
+    io.emit('all_auctions', allAuctions); // Notify all clients
+
     res.json({ success: true, auction: newAuction });
 });
 
 
-app.get('/api/auctions/:id', (req: Request, res: Response) => {
-    const auction = auctionEngine.getAuction(req.params.id);
+app.get('/api/auctions/:id', async (req: Request, res: Response) => {
+    const auction = await auctionEngine.getAuction(req.params.id);
     if (auction) {
         res.json(auction);
     } else {
@@ -121,11 +134,11 @@ app.get('/api/auctions/:id', (req: Request, res: Response) => {
     }
 });
 
-app.delete('/api/auctions/:id', (req: Request, res: Response) => {
+app.delete('/api/auctions/:id', async (req: Request, res: Response) => {
     const auctionId = req.params.id;
     const { sellerAddress } = req.body; // In a real app, this would be from auth/session
 
-    const auction = auctionEngine.getAuction(auctionId);
+    const auction = await auctionEngine.getAuction(auctionId);
     if (!auction) {
         res.status(404).json({ error: 'Auction not found' });
         return;
@@ -137,9 +150,10 @@ app.delete('/api/auctions/:id', (req: Request, res: Response) => {
     }
 
     // Engine handles bid check (status 400 if bids exist or other failure)
-    const success = auctionEngine.deleteAuction(auctionId);
+    const success = await auctionEngine.deleteAuction(auctionId);
     if (success) {
-        io.emit('all_auctions', auctionEngine.getAllAuctions());
+        const allAuctions = await auctionEngine.getAllAuctions();
+        io.emit('all_auctions', allAuctions);
         res.json({ success: true });
     } else {
         res.status(400).json({ error: 'Cannot delete auction. It may have active bids.' });
@@ -164,7 +178,8 @@ app.post('/api/test/simulate-bid', async (req: Request, res: Response) => {
 
     if (validatedBid) {
         io.emit('new_bid', { auctionId, bid: validatedBid });
-        io.emit('auction_updated', auctionEngine.getAuction(auctionId));
+        const updatedAuction = await auctionEngine.getAuction(auctionId);
+        io.emit('auction_updated', updatedAuction);
         res.json({ success: true, bid: validatedBid });
     } else {
         res.status(400).json({ success: false, error: 'Bid rejected by engine rules' });
@@ -172,6 +187,21 @@ app.post('/api/test/simulate-bid', async (req: Request, res: Response) => {
 });
 
 const PORT = process.env.PORT || 3500;
-httpServer.listen(PORT, () => {
-    console.log(`[Server] Auction Engine running on port ${PORT}`);
-});
+const MONGO_URI = process.env.MONGODB_URI;
+
+const startServer = async () => {
+    if (MONGO_URI) {
+        await connectDB(MONGO_URI);
+    } else {
+        console.warn('[Database] MONGODB_URI not found in .env. Persistence disabled (errors will occur).');
+    }
+
+    // Start background tasks
+    startMonitoring();
+
+    httpServer.listen(PORT, () => {
+        console.log(`[Server] Auction Engine running on port ${PORT}`);
+    });
+};
+
+startServer();

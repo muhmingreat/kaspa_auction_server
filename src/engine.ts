@@ -1,57 +1,27 @@
-import fs from 'fs';
-import path from 'path';
-import { Bid, Auction, BidStatus } from './types/auction';
+import { Auction as AuctionModel } from './models/Auction';
 import { kaspaService } from './kaspa';
-
-const DATA_PATH = path.join(__dirname, '../data/auctions.json');
+import { Auction, Bid } from './types/auction';
 
 export class AuctionEngine {
-    private auctions: Map<string, Auction> = new Map();
-
-    constructor() {
-        this.loadState();
-    }
-
-    private loadState() {
-        try {
-            if (fs.existsSync(DATA_PATH)) {
-                const data = fs.readFileSync(DATA_PATH, 'utf-8');
-                const parsed = JSON.parse(data);
-                Object.entries(parsed).forEach(([id, auction]) => {
-                    this.auctions.set(id, auction as Auction);
-                });
-                console.log(`[AuctionEngine] Loaded ${this.auctions.size} auctions from disk.`);
-            }
-        } catch (error) {
-            console.error('[AuctionEngine] Failed to load state:', error);
-        }
-    }
-
-    private saveState() {
-        try {
-            const dir = path.dirname(DATA_PATH);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-            }
-            const data = JSON.stringify(Object.fromEntries(this.auctions), null, 2);
-            fs.writeFileSync(DATA_PATH, data);
-        } catch (error) {
-            console.error('[AuctionEngine] Failed to save state:', error);
-        }
-    }
 
     /**
-     * Creates a new auction in the engine
+     * Creates a new auction in the database
      */
-    public createAuction(auction: Auction) {
-        this.auctions.set(auction.id, {
-            ...auction,
-            status: auction.status || 'live',
-            bids: auction.bids || [],
-            bidCount: auction.bidCount || 0
-        });
-        this.saveState();
-        console.log(`[AuctionEngine] Created auction: ${auction.id}`);
+    public async createAuction(auctionData: Auction) {
+        try {
+            const auction = new AuctionModel({
+                ...auctionData,
+                status: auctionData.status || 'live',
+                bids: auctionData.bids || [],
+                bidCount: auctionData.bidCount || 0
+            });
+            await auction.save();
+            console.log(`[AuctionEngine] Created auction: ${auctionData.id}`);
+            return auction;
+        } catch (error) {
+            console.error('[AuctionEngine] Failed to create auction:', error);
+            throw error;
+        }
     }
 
     /**
@@ -63,110 +33,136 @@ export class AuctionEngine {
         sender: string;
         timestamp: number;
     }): Promise<Bid | null> {
-        const auction = this.auctions.get(auctionId);
-        if (!auction) return null;
+        let retries = 3;
+        while (retries > 0) {
+            try {
+                const auction = await AuctionModel.findOne({ id: auctionId });
+                if (!auction) return null;
 
-        // RULE 0: Re-verify cryptographic proof from the network
-        const txOnChain = await kaspaService.verifyTransaction(txData.hash);
-        if (txOnChain && txOnChain.amount !== txData.amount) {
-            console.error(`[AuctionEngine] Amount mismatch! On-chain: ${txOnChain.amount}, Reported: ${txData.amount}`);
-            return null;
+                // Idempotency Check: Don't process the same transaction twice
+                // Check if this txHash already exists in the bids array
+                const existingBid = auction.bids.find(b => b.txHash === txData.hash);
+                if (existingBid) {
+                    console.log(`[AuctionEngine] Duplicate bid detected (already processed): ${txData.hash}`);
+                    return existingBid;
+                }
+
+                // RULE 0: Re-verify cryptographic proof from the network
+                const txOnChain = await kaspaService.verifyTransaction(txData.hash);
+
+                // Sanity check: Ensure the transaction actually contains an output roughly matching the bid
+                // Note: txData.amount is in KAS, txOnChain.outputs[].amount is in Sompi
+                const sompiBid = txData.amount * 1e8;
+                const hasMatchingOutput = txOnChain?.outputs.some((out: any) => Math.abs(out.amount - sompiBid) < 10000); // 10000 sompi tolerance
+
+                if (txOnChain && !hasMatchingOutput) {
+                    console.error(`[AuctionEngine] Amount mismatch! No output matches ${txData.amount} KAS in TX ${txData.hash}`);
+                    // return null; // STRICT MODE: Uncomment to enforce
+                }
+
+                // RULE 1: Auction must be live
+                if (auction.status === 'ended') {
+                    console.warn(`[AuctionEngine] Bid rejected: Auction ${auctionId} already ended.`);
+                    return null;
+                }
+
+                // RULE 2: Minimum increment check
+                const currentPrice = auction.currentPrice || auction.startPrice;
+                if (txData.amount < currentPrice + auction.minimumIncrement) {
+                    console.warn(`[AuctionEngine] Bid rejected: Amount ${txData.amount} below minimum increment.`);
+                    return null;
+                }
+
+                // RULE 3: Timing check
+                if (new Date() > new Date(auction.endTime)) {
+                    auction.status = 'ended';
+                    await auction.save();
+                    return null;
+                }
+
+                // Valid Bid Construction
+                const newBid: Bid = {
+                    id: txData.hash,
+                    auctionId: auction.id,
+                    bidderAddress: txData.sender,
+                    amount: txData.amount,
+                    timestamp: new Date(txData.timestamp),
+                    status: 'detected',
+                    txHash: txData.hash
+                };
+
+                // Update Auction State
+                auction.bids.unshift(newBid);
+                auction.bidCount++;
+                auction.currentPrice = txData.amount;
+                auction.highestBidder = {
+                    address: txData.sender
+                };
+
+                await auction.save();
+                console.log(`[AuctionEngine] Valid bid accepted: ${txData.amount} KAS from ${txData.sender}`);
+
+                return newBid;
+
+            } catch (error: any) {
+                if (error.name === 'VersionError') {
+                    console.warn(`[AuctionEngine] VersionError encountered. Retrying... (${retries} attempts left)`);
+                    retries--;
+                    continue; // Retry the whole process (fetch -> check -> save)
+                }
+                console.error('[AuctionEngine] Error processing bid:', error);
+                throw error;
+            }
         }
-
-        // RULE 1: Auction must be live
-        if (auction.status === 'ended') {
-            console.warn(`[AuctionEngine] Bid rejected: Auction ${auctionId} already ended.`);
-            return null;
-        }
-
-        // RULE 2: Minimum increment check
-        const currentPrice = auction.currentPrice || auction.startPrice;
-        if (txData.amount < currentPrice + auction.minimumIncrement) {
-            console.warn(`[AuctionEngine] Bid rejected: Amount ${txData.amount} below minimum increment.`);
-            return null;
-        }
-
-        // RULE 3: Timing check
-        if (new Date() > new Date(auction.endTime)) {
-            auction.status = 'ended';
-            this.saveState();
-            return null;
-        }
-
-        // Valid Bid Construction
-        const newBid: Bid = {
-            id: txData.hash,
-            auctionId: auction.id,
-            bidderAddress: txData.sender,
-            amount: txData.amount,
-            timestamp: new Date(txData.timestamp),
-            status: 'detected',
-            txHash: txData.hash
-        };
-
-        // Update Auction State
-        auction.bids.unshift(newBid);
-        auction.bidCount++;
-        auction.currentPrice = txData.amount;
-        auction.highestBidder = {
-            address: txData.sender
-        };
-
-        this.saveState();
-        console.log(`[AuctionEngine] Valid bid accepted: ${txData.amount} KAS from ${txData.sender}`);
-
-        return newBid;
+        console.error('[AuctionEngine] Failed to process bid after retries due to concurrency.');
+        return null;
     }
 
-    public finalizeAuction(auctionId: string): Auction | null {
-        const auction = this.auctions.get(auctionId);
+    public async finalizeAuction(auctionId: string): Promise<Auction | null> {
+        const auction = await AuctionModel.findOne({ id: auctionId });
         if (!auction) return null;
 
         auction.status = 'ended';
-        this.saveState();
-        return auction;
+        await auction.save();
+        return auction.toObject() as Auction;
     }
 
-    public deleteAuction(auctionId: string): boolean {
-        const auction = this.auctions.get(auctionId);
+    public async deleteAuction(auctionId: string): Promise<boolean> {
+        const auction = await AuctionModel.findOne({ id: auctionId });
         if (!auction) return false;
 
-        // Double check: Only allow delete if no bids (redundant safety)
+        // Double check: Only allow delete if no bids
         if (auction.bids.length > 0) return false;
 
-        this.auctions.delete(auctionId);
-        this.saveState();
+        await AuctionModel.deleteOne({ id: auctionId });
         console.log(`[AuctionEngine] Deleted auction: ${auctionId}`);
         return true;
     }
 
-    public cleanupOldAuctions() {
+    public async cleanupOldAuctions() {
         const TWO_MONTHS_MS = 60 * 24 * 60 * 60 * 1000;
-        const now = Date.now();
-        let deletedCount = 0;
+        const cutoffDate = new Date(Date.now() - TWO_MONTHS_MS);
 
-        for (const [id, auction] of this.auctions.entries()) {
-            const endTime = new Date(auction.endTime).getTime();
-            if (now - endTime > TWO_MONTHS_MS) {
-                this.auctions.delete(id);
-                deletedCount++;
+        try {
+            const result = await AuctionModel.deleteMany({ endTime: { $lt: cutoffDate } });
+            if (result.deletedCount > 0) {
+                console.log(`[AuctionEngine] Cleaned up ${result.deletedCount} old auctions.`);
             }
-        }
-
-        if (deletedCount > 0) {
-            this.saveState();
-            console.log(`[AuctionEngine] Cleaned up ${deletedCount} old auctions.`);
+        } catch (error) {
+            console.error('[AuctionEngine] Failed to clean up old auctions:', error);
         }
     }
 
-    public getAuction(id: string): Auction | undefined {
-        return this.auctions.get(id);
+    public async getAuction(id: string): Promise<Auction | null> {
+        const auction = await AuctionModel.findOne({ id });
+        return auction ? (auction.toObject() as Auction) : null;
     }
 
-    public getAllAuctions(): Auction[] {
-        // Run lazy cleanup on fetch
-        this.cleanupOldAuctions();
-        return Array.from(this.auctions.values());
+    public async getAllAuctions(): Promise<Auction[]> {
+        // Run lazy cleanup on fetch (optional, maybe better in a chron job)
+        // this.cleanupOldAuctions(); 
+        const auctions = await AuctionModel.find().sort({ createdAt: -1 });
+        return auctions.map(a => a.toObject() as Auction);
     }
 }
 

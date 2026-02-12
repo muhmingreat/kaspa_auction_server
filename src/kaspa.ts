@@ -9,12 +9,60 @@ dotenv.config();
  */
 export class KaspaService {
     private rpcUrl: string;
+    private fallbackUrls: string[] = [];
 
     constructor() {
         const network = process.env.NETWORK || 'mainnet';
-        this.rpcUrl = network === 'testnet'
-            ? process.env.KASPA_RPC_URL_TESTNET || 'https://api-tn10.kaspa.org'
-            : process.env.KASPA_RPC_URL || 'https://api.kaspa.org';
+        if (network === 'testnet') {
+            this.rpcUrl = process.env.KASPA_RPC_URL_TESTNET || 'https://api-tn10.kaspa.org';
+            this.fallbackUrls = [
+                'https://api-tn10.kaspa.org',
+                'https://kaspa-rest.fyi' // Added as a potential fallback from research
+            ];
+        } else {
+            this.rpcUrl = process.env.KASPA_RPC_URL || 'https://api.kaspa.org';
+            this.fallbackUrls = ['https://api.kaspa.org'];
+        }
+    }
+
+    /**
+     * Helper to perform GET requests with retries and fallback endpoint rotation.
+     */
+    private async fetchWithRetry(path: string, retries = 3): Promise<any> {
+        let lastError: any;
+        const urls = [this.rpcUrl, ...this.fallbackUrls.filter(u => u !== this.rpcUrl)];
+
+        for (const url of urls) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await axios.get(`${url}${path}`, { timeout: 15000 });
+                    return response.data;
+                } catch (error: any) {
+                    lastError = error;
+                    const status = error.response?.status;
+                    const message = error.message || '';
+                    const errMsg = (error.toString() || '').toLowerCase();
+
+                    // Log warning
+                    console.warn(`[KaspaService] Attempt ${i + 1} failed for ${url}${path}: ${status || message}`);
+
+                    // Don't retry on 404 (Not Found)
+                    if (status === 404) throw error;
+
+                    // Check for SSL/Network specific errors to ensure we retry
+                    const isSSLError = errMsg.includes('ssl') || errMsg.includes('bad record mac') || errMsg.includes('econnreset');
+
+                    // Exponential backoff
+                    if (i < retries - 1) {
+                        const waitTime = Math.pow(2, i) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, waitTime));
+                    }
+                }
+            }
+            console.warn(`[KaspaService] All retries failed for ${url}, trying next fallback...`);
+        }
+
+        throw lastError;
     }
 
     /**
@@ -26,11 +74,9 @@ export class KaspaService {
             console.error(`[KaspaService] Invalid address format: ${address}`);
             return [];
         }
-        // Use plain address (no percent‑encoding) for the API request
-        const url = `${this.rpcUrl}/addresses/${address}/utxos`;
+
         try {
-            const response = await axios.get(url);
-            const data = response.data;
+            const data = await this.fetchWithRetry(`/addresses/${address}/utxos`);
 
             // Map API response to expected internal format
             // API returns: { outpoint: { transactionId, index }, utxoEntry: { amount, ... } }
@@ -44,7 +90,7 @@ export class KaspaService {
             }
             return [];
         } catch (error) {
-            console.error(`[KaspaService] Error fetching UTXOs for ${address}:`, error);
+            console.error(`[KaspaService] Failed to fetch UTXOs for ${address} after all retries.`);
             return [];
         }
     }
@@ -54,8 +100,7 @@ export class KaspaService {
      */
     public async verifyTransaction(txHash: string) {
         try {
-            const response = await axios.get(`${this.rpcUrl}/transactions/${txHash}`);
-            const tx = response.data;
+            const tx = await this.fetchWithRetry(`/transactions/${txHash}`);
 
             if (!tx || !tx.outputs) return null;
 
@@ -71,8 +116,7 @@ export class KaspaService {
                     const prevIndex = tx.inputs[0].previous_outpoint_index;
                     console.log(`[KaspaService] Resolving sender for ${txHash} from prevTx ${prevHash}:${prevIndex}`);
 
-                    const prevRes = await axios.get(`${this.rpcUrl}/transactions/${prevHash}`);
-                    const prevTx = prevRes.data;
+                    const prevTx = await this.fetchWithRetry(`/transactions/${prevHash}`);
 
                     if (prevTx && prevTx.outputs && prevTx.outputs[prevIndex]) {
                         sender = prevTx.outputs[prevIndex].script_public_key_address;
@@ -86,12 +130,12 @@ export class KaspaService {
             return {
                 isAccepted: tx.is_accepted,
                 blueScore: tx.accepting_block_blue_score,
-                amount: (tx.outputs[0]?.amount || 0) / 1e8, // Convert Sompi to KAS
+                outputs: tx.outputs, // Return full outputs for better validation
                 sender: sender,
                 timestamp: tx.block_time || Date.now()
             };
         } catch (error) {
-            console.error(`[KaspaService] Error verifying tx ${txHash}:`, error);
+            console.error(`[KaspaService] Failed to verify tx ${txHash} after all retries.`);
             return null;
         }
     }
@@ -101,10 +145,9 @@ export class KaspaService {
      */
     public async getNetworkInfo() {
         try {
-            const response = await axios.get(`${this.rpcUrl}/info/dagconfig`);
-            return response.data;
+            return await this.fetchWithRetry('/info/dagconfig');
         } catch (error) {
-            console.error('[KaspaService] Error fetching network info:', error);
+            console.error('[KaspaService] Failed to fetch network info after all retries.');
             return null;
         }
     }
@@ -116,11 +159,18 @@ export class KaspaService {
     public monitorAddress(address: string, onNewTx: (tx: any) => void) {
         let lastSeenUtxos = new Set<string>();
         let isFirstCheck = true;
+        let isRunning = true;
 
         const check = async () => {
+            if (!isRunning) return;
+
             try {
                 const utxos = await this.getAddressUtxos(address);
-                if (!utxos || !Array.isArray(utxos)) return;
+                if (!utxos || !Array.isArray(utxos)) {
+                    // Check again later
+                    setTimeout(check, 5000);
+                    return;
+                }
 
                 const currentUtxoIds = new Set(utxos.map((u: any) => `${u.utxoId}-${u.amount}`));
 
@@ -149,14 +199,19 @@ export class KaspaService {
                 isFirstCheck = false;
             } catch (error) {
                 console.error(`[KaspaService] Error monitoring ${address}:`, error);
+            } finally {
+                // Schedule next check only after this one completes
+                if (isRunning) {
+                    setTimeout(check, 2000);
+                }
             }
         };
 
-        // Poll every 2 seconds for fresh updates (Kaspa is fast!)
-        const interval = setInterval(check, 2000);
         check(); // Initial check
 
-        return () => clearInterval(interval);
+        return () => {
+            isRunning = false;
+        };
     }
 }
 
