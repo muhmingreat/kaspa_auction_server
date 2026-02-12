@@ -44,7 +44,7 @@ export class AuctionEngine {
                 const existingBid = auction.bids.find(b => b.txHash === txData.hash);
                 if (existingBid) {
                     console.log(`[AuctionEngine] Duplicate bid detected (already processed): ${txData.hash}`);
-                    return existingBid;
+                    return existingBid.toObject() as Bid;
                 }
 
                 // RULE 0: Re-verify cryptographic proof from the network

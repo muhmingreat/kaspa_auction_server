@@ -6,7 +6,7 @@ const BidSchema = new mongoose.Schema({
     bidderAddress: { type: String, required: true },
     amount: { type: Number, required: true },
     timestamp: { type: Date, default: Date.now },
-    status: { type: String, default: 'detected' },
+    status: { type: String, enum: ['pending', 'detected', 'confirmed'], default: 'detected' },
     txHash: { type: String, required: true }
 });
 
